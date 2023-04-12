@@ -26,13 +26,19 @@ bool g_isListening = false;
 // based on 24bit signed int w/ FSR = +/-16 g, datasheet option
 #define ACCEL_SCALAR (1.0f / 8388608.0f * 16.0f)
 
+#define MAG_SCALAR (1.0f / 32768.0f) * 1600.0f
+#define MAG_OFFSET -1600.0f
+
 static int rows, cols;
 static FusionEuler euler;
 static FusionVector earth;
 static FusionQuaternion qt;
+static int visual_marker = 0;
 
 HANDLE trackThread;
 HANDLE listenThread;
+static HANDLE hFile;
+static FILE* fpt;
 
 hid_device* device;
 
@@ -47,6 +53,7 @@ typedef struct {
 	uint64_t tick;
 	int32_t ang_vel[3];
 	int32_t accel[3];
+	uint16_t mag[3];
 } air_sample;
 
 
@@ -187,6 +194,16 @@ parse_report(const unsigned char* buffer_in, int size, air_sample* out_sample)
 		// out_sample->accel[2] = *(buffer_in++) | (*(buffer_in++) << 8) | (*(buffer_in++) << 16);
 	}
 
+	// mag data
+	buffer_in += 6;
+
+	out_sample->mag[0] = *(buffer_in++);
+	out_sample->mag[0] |= (*(buffer_in++) << 8);
+	out_sample->mag[1] = *(buffer_in++);
+	out_sample->mag[1] |= (*(buffer_in++) << 8);
+	out_sample->mag[2] = *(buffer_in++);
+	out_sample->mag[2] |= (*(buffer_in++) << 8);
+
 	return 0;
 }
 
@@ -196,9 +213,9 @@ process_ang_vel(const int32_t in_ang_vel[3], float out_vec[])
 {
 
 	// these scale and bias corrections are all rough guesses
-	out_vec[0] = (float)(in_ang_vel[0]) * -1.0f * GYRO_SCALAR;
-	out_vec[1] = (float)(in_ang_vel[2]) * GYRO_SCALAR;
-	out_vec[2] = (float)(in_ang_vel[1]) * GYRO_SCALAR;
+	out_vec[0] = (float)(in_ang_vel[0]) * GYRO_SCALAR;
+	out_vec[1] = (float)(in_ang_vel[1]) * GYRO_SCALAR;
+	out_vec[2] = (float)(in_ang_vel[2]) * GYRO_SCALAR;
 }
 
 static void
@@ -206,9 +223,46 @@ process_accel(const int32_t in_accel[3], float out_vec[])
 {
 	// these scale and bias corrections are all rough guesses
 	out_vec[0] = (float)(in_accel[0]) * ACCEL_SCALAR;
-	out_vec[1] = (float)(in_accel[2]) * ACCEL_SCALAR;
-	out_vec[2] = (float)(in_accel[1]) * ACCEL_SCALAR;
+	out_vec[1] = (float)(in_accel[1]) * ACCEL_SCALAR;
+	out_vec[2] = (float)(in_accel[2]) * ACCEL_SCALAR;
 
+}
+
+static void
+process_mag(const uint16_t in_mag[3], float out_vec[])
+{
+	// these scale and bias corrections are all rough guesses
+	out_vec[0] = (float)(in_mag[0]) * MAG_SCALAR + MAG_OFFSET;
+	out_vec[1] = (float)(in_mag[1]) * MAG_SCALAR + MAG_OFFSET;
+	out_vec[2] = (float)(in_mag[2]) * MAG_SCALAR + MAG_OFFSET;
+}
+
+
+static void
+open_csv_logfile()
+{
+	char filename[40];
+	struct tm* timenow;
+
+	time_t now = time(NULL);
+	timenow = gmtime(&now);
+
+	strftime(filename, sizeof(filename), "./logs/data_%Y-%m-%d_%H-%M-%S.csv", timenow);
+
+	fpt = fopen(filename, "w+");
+
+	if (fpt == NULL) {
+		// get out code
+		printf("File open failed. Exiting...");
+		exit(1);
+	}
+	else
+	{
+		printf("CSV Logfile opened: %s\n", filename);
+	}
+
+
+	fprintf(fpt, "ts_nanoseconds, gyro1_dps, gyro2_dps, gyro3_dps, accel1_g, accel2_g, accel3_g, mag1_uT, mag2_uT, mag3_uT, euler1_deg, euler2_deg, euler3_deg, quat1, quat2, quat3, quat4, accel_err_deg, accel_ignored, accel_rej_timer,mag_err_deg,mag_ignored,mag_rej_timer, initialising, accel_rej_warn, accel_rej_timeout, mag_rej_warn, mag_rej_timeout, visual_marker\n");
 }
 
 
@@ -230,6 +284,9 @@ open_device()
 	}
 
 	hid_free_enumeration(devs);
+
+	open_csv_logfile();
+
 	return device;
 }
 
@@ -268,6 +325,7 @@ DWORD WINAPI track(LPVOID lpParam) {
 	//static FusionVector ang_vel = {}, accel_vec = {};
 	static float ang_vel[3] = {};
 	static float accel_vec[3] = {};
+	static float mag_vec[3] = {};
 
 
 	// Define calibration (replace with actual calibration data if available)
@@ -314,6 +372,10 @@ DWORD WINAPI track(LPVOID lpParam) {
 			std::cerr << e.what();
 		}
 
+		if (buffer[0] != 0x01 || buffer[1] != 0x02) {
+			continue;
+		}
+
 
 		//parse
 		parse_report(buffer, sizeof(buffer), &sample);
@@ -321,6 +383,7 @@ DWORD WINAPI track(LPVOID lpParam) {
 		//process sample
 		process_ang_vel(sample.ang_vel, ang_vel);
 		process_accel(sample.accel, accel_vec);
+		process_mag(sample.mag, mag_vec);
 
 		// Acquire latest sensor data
 		const uint64_t timestamp = sample.tick; // replace this with actual gyroscope timestamp
@@ -339,15 +402,36 @@ DWORD WINAPI track(LPVOID lpParam) {
 		const float deltaTime = (float)(timestamp - previousTimestamp) / (float)1e9;
 		previousTimestamp = timestamp;
 
+		if (deltaTime > 0.01) {
+			FusionAhrsReset(&ahrs);
+			continue;
+		}
+
 		// Update gyroscope AHRS algorithm
 		FusionAhrsUpdateNoMagnetometer(&ahrs, gyroscope, accelerometer, deltaTime);
+
+		int visual_target_num = 0;
 
 		//lock mutex and update values
 		mtx.lock();
 		qt = FusionAhrsGetQuaternion(&ahrs);
 		euler = FusionQuaternionToEuler(qt);
 		earth = FusionAhrsGetEarthAcceleration(&ahrs);
+		visual_target_num = visual_marker;
 		mtx.unlock();
+
+		FusionAhrsInternalStates internal_states = FusionAhrsGetInternalStates(&ahrs);
+		FusionAhrsFlags ahrs_flags = FusionAhrsGetFlags(&ahrs);
+
+		
+
+		fprintf(fpt, "%I64u, %f, %f, %f, %f, %f, %f, %f, %f, %f,", timestamp, ang_vel[0], ang_vel[1], ang_vel[2], accel_vec[0], accel_vec[1], accel_vec[2], mag_vec[0], mag_vec[1], mag_vec[2]);
+		fprintf(fpt, " %f, %f, %f, %f, %f, %f, %f,", euler.angle.roll, euler.angle.pitch, euler.angle.yaw, qt.element.w, qt.element.x, qt.element.y, qt.element.z);
+		fprintf(fpt, " %f, %d, %f, %f, %d, %f,", internal_states.accelerationError, internal_states.accelerometerIgnored, internal_states.accelerationRejectionTimer,
+			internal_states.magneticError, internal_states.magnetometerIgnored, internal_states.magneticRejectionTimer);
+		fprintf(fpt, " %d, %d, %d, %d, %d,", ahrs_flags.initialising, ahrs_flags.accelerationRejectionWarning, ahrs_flags.accelerationRejectionTimeout,
+			ahrs_flags.magneticRejectionWarning, ahrs_flags.magneticRejectionTimeout);
+		fprintf(fpt, " %d\n", visual_target_num);
 
 	}
 	return 0;
@@ -396,6 +480,7 @@ DWORD WINAPI interface4Handler(LPVOID lpParam) {
 			}
 		}
 	}
+	return 1;
 }
 
 
@@ -450,6 +535,8 @@ int StartConnection()
 		}
 		std::cout << "Listenr Thread Started" << std::endl;
 
+		visual_marker = 0;
+
 		return 1;
 	}
 }
@@ -469,6 +556,11 @@ int StopConnection()
 		WaitForSingleObject(listenThread, INFINITE);
 		TerminateThread(listenThread, 0);
 		CloseHandle(listenThread);
+
+		fclose(fpt);
+
+		std::cout << "CSV logfile closed" << std::endl;
+
 		return 1;
 	}
 	else {
@@ -500,6 +592,15 @@ float* GetEuler()
 	e[2] = euler.angle.yaw;
 	mtx.unlock();
 	return e;
+}
+
+void SetVisualMarker(int marker)
+{
+	mtx.lock();
+	visual_marker = marker;
+	mtx.unlock();
+
+	return;
 }
 
 
